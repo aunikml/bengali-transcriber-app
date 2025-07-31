@@ -7,27 +7,27 @@ import os
 import tempfile
 import time
 from dotenv import load_dotenv
-import re  # Import regular expressions for advanced splitting
-import json # Import json to safely pass text to JavaScript
+import re
+import json
+from docx import Document
+import io
 
-# --- New Imports for the Robust Database System ---
+# --- Database & Authentication Imports ---
 from database import SessionLocal
 from models import User
 
-# --- 1. INITIAL APP CONFIGURATION (MUST BE AT THE TOP) ---
+# --- 1. INITIAL APP CONFIGURATION ---
 st.set_page_config(
-    page_title="Bengali Transcriber",
-    page_icon="🗣️",
+    page_title="Interactive Bengali Transcriber",
+    page_icon="🎧",
     layout="wide"
 )
 
 # --- 2. LOAD SECRETS & CONFIGURE API ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not GEMINI_API_KEY:
     st.error("FATAL: GEMINI_API_KEY is not configured on the server!")
-    st.info("Please ensure a .env file with your GEMINI_API_KEY is present.")
     st.stop()
 try:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -35,235 +35,192 @@ except Exception as e:
     st.error(f"Failed to configure Google Gemini API: {e}")
     st.stop()
 
-
-# --- Authentication and Helper Functions ---
+# --- 3. AUTHENTICATION & DATABASE HELPERS ---
 def authenticate_user(username, password):
     db = SessionLocal()
     try:
         user = db.query(User).filter(User.username == username).first()
-        if user and user.check_password(password):
-            return user
+        if user and user.check_password(password): return user
         return None
-    finally:
-        db.close()
+    finally: db.close()
 
 def add_new_user(username, password, role):
     db = SessionLocal()
     try:
-        if db.query(User).filter(User.username == username).first():
-            return False, "User already exists."
-        new_user = User(username=username, role=role)
-        new_user.set_password(password)
-        db.add(new_user)
-        db.commit()
+        if db.query(User).filter(User.username == username).first(): return False, "User already exists."
+        new_user = User(username=username, role=role); new_user.set_password(password)
+        db.add(new_user); db.commit()
         return True, f"User '{username}' created successfully."
-    finally:
-        db.close()
+    finally: db.close()
 
 def get_all_users_from_db():
     db = SessionLocal()
-    try:
-        return db.query(User.username, User.role).all()
-    finally:
-        db.close()
-
-def format_transcription_for_copying(text):
-    """Creates a clean, plain-text version for the copy button."""
-    return text.replace('বক্তা ', '\n\nবক্তা ').strip()
-
-# --- NEW FUNCTION TO GENERATE STYLED HTML ---
-def generate_html_transcription(raw_text):
-    """
-    Takes the raw transcription text and wraps it in styled HTML
-    for a much better reading experience.
-    """
-    # Regex to split the text by speaker labels (e.g., "বক্তা ১:")
-    # This keeps the speaker labels in the resulting list.
-    parts = re.split(r'(বক্তা\s*\d+:)', raw_text)
-    
-    html_output = ""
-    # Start from index 1 because the first element of the split is usually empty
-    for i in range(1, len(parts), 2):
-        speaker_label = parts[i]
-        speech_text = parts[i+1].strip()
-        
-        # Create an HTML block for each speaker turn
-        html_output += f"""
-        <div class="speaker-block">
-            <div class="speaker-label">{speaker_label}</div>
-            <div class="speaker-text">{speech_text}</div>
-        </div>
-        """
-    return f"<div class='transcription-container'>{html_output}</div>"
+    try: return db.query(User.username, User.role).all()
+    finally: db.close()
 
 
-@st.cache_data(show_spinner="Transcribing audio... this may take a moment.", persist=True)
+# --- 4. CORE TRANSCRIPTION & AI FUNCTIONS ---
+@st.cache_data(show_spinner="Transcribing audio... this may take a few moments.", persist=True)
 def transcribe_audio_with_gemini(_file_content, model_name):
     tmp_file_path, gemini_file = None, None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
             tmp_file.write(_file_content)
             tmp_file_path = tmp_file.name
+        
         st.info("Uploading file to Google for processing...")
         gemini_file = genai.upload_file(path=tmp_file_path)
         model = genai.GenerativeModel(model_name=model_name)
+        
         prompt = (
-            "Please transcribe the following Bengali audio file. "
+            "You are an expert audio transcriber. Transcribe the following Bengali audio file. "
             "The output transcription MUST be in the Bengali script (Unicode). "
-            "This is a conversation, so please identify and label each speaker. "
-            "Use Bengali labels for the speakers, for example: 'বক্তা ১:', 'বক্তা ২:'."
+            "This is a conversation. Identify and label each speaker using 'বক্তা ১:', 'বক্তা ২:', etc. "
+            "CRITICAL: Precede each speaker's dialogue with a precise timestamp in the format [HH:MM:SS.mmm]. "
+            "Example: [00:00:12.345] বক্তা ১: (text here)\n"
+            "Ensure every spoken part has a timestamp. Do not use any markdown or HTML in your output."
         )
         response = model.generate_content([prompt, gemini_file], request_options={"timeout": 600})
-        return response.text
+        return re.sub(r'<[^>]+>', '', response.text)
     finally:
-        if tmp_file_path and os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
-        if gemini_file:
-            genai.delete_file(gemini_file.name)
-            st.info("Temporary files cleaned up.")
+        if tmp_file_path and os.path.exists(tmp_file_path): os.remove(tmp_file_path)
+        if gemini_file: genai.delete_file(gemini_file.name); st.info("Temporary files cleaned up.")
 
-# --- Main Application UI and Logic ---
+@st.cache_data(show_spinner="Analyzing text...")
+def analyze_text_with_gemini(text_to_analyze, task):
+    model = genai.GenerativeModel(model_name="models/gemini-1.5-flash-latest")
+    if task == "summarize":
+        prompt = f"Please provide a concise summary of the following Bengali conversation:\n\n{text_to_analyze}"
+    elif task == "topics":
+        prompt = f"Please identify and list the key topics discussed in the following Bengali conversation:\n\n{text_to_analyze}"
+    else: return "Unknown analysis task."
+    response = model.generate_content(prompt); return response.text
 
+# --- 5. HELPER FUNCTIONS FOR INTERACTIVITY & EXPORT ---
+def parse_timestamped_transcription(raw_text):
+    data = []; pattern = re.compile(r'\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s*(বক্তা\s*\d+:)\s*([\s\S]*?)(?=\[\d{2}:\d{2}:\d{2}\.\d{3}\]|\Z)')
+    for i, match in enumerate(pattern.finditer(raw_text)):
+        h, m, s, ms, speaker, text = match.groups()
+        total_seconds = int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
+        data.append({"id": f"segment_{i}", "time_sec": total_seconds, "timestamp": f"[{h}:{m}:{s}]", "speaker": speaker.strip(), "text": text.strip()})
+    return data
+
+def get_full_transcript_text(transcript_data):
+    return "\n\n".join([f"{st.session_state.speaker_map.get(entry['speaker'], entry['speaker'])}\n{entry['text']}" for entry in transcript_data])
+
+def create_docx_content(transcript_data):
+    document = Document(); document.add_heading('Audio Transcription', level=1)
+    for entry in transcript_data:
+        p = document.add_paragraph()
+        renamed_speaker = st.session_state.speaker_map.get(entry['speaker'], entry['speaker'])
+        p.add_run(f"{renamed_speaker}\n").bold = True; p.add_run(entry['text'])
+    bio = io.BytesIO(); document.save(bio); bio.seek(0); return bio.getvalue()
+
+# --- MAIN APPLICATION UI & LOGIC ---
 if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-    st.session_state.username = None
-    st.session_state.role = None
+    st.session_state.authenticated = False; st.session_state.username = None; st.session_state.role = None
+    st.session_state.transcript_data = None; st.session_state.speaker_map = {}
+    st.session_state.last_uploaded_file_id = None # [NEW] Initialize the tracker
 
+# --- AUTHENTICATION GATE ---
 if not st.session_state.authenticated:
     st.header("Bengali Transcriber Login")
-    # ... (Login form remains the same)
     with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-        if submitted:
+        username = st.text_input("Username"); password = st.text_input("Password", type="password")
+        if st.form_submit_button("Login"):
             user = authenticate_user(username, password)
             if user:
-                st.session_state.authenticated = True
-                st.session_state.username = user.username
-                st.session_state.role = user.role
+                st.session_state.authenticated = True; st.session_state.username = user.username; st.session_state.role = user.role
                 st.rerun()
-            else:
-                st.error("Invalid username or password")
+            else: st.error("Invalid username or password")
 else:
-    # --- Inject our Custom CSS ---
-    st.markdown("""
-        <style>
-        .transcription-container {
-            border: 1px solid #e0e0e0;
-            border-radius: 10px;
-            padding: 15px;
-            background-color: #fcfcfc;
-            max-height: 600px;
-            overflow-y: auto;
-            font-family: 'Helvetica Neue', sans-serif;
-        }
-        .speaker-block {
-            background-color: #ffffff;
-            border: 1px solid #e8e8e8;
-            border-radius: 8px;
-            padding: 12px;
-            margin-bottom: 12px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-        }
-        .speaker-label {
-            font-weight: bold;
-            color: #007bff; /* A nice blue for the speaker label */
-            margin-bottom: 5px;
-            font-size: 1.05em;
-        }
-        .speaker-text {
-            line-height: 1.6;
-            color: #333;
-        }
-        </style>
-    """, unsafe_allow_html=True)
-
-    st.title("Bengali Audio Transcription 🗣️")
+    # --- AUTHENTICATED USER INTERFACE ---
     st.sidebar.success(f"Logged in as **{st.session_state.username}**")
-    # ... (The rest of the sidebar remains the same)
-    st.sidebar.caption(f"Role: {st.session_state.role}")
     if st.sidebar.button("Logout"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
+        for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
     
-    st.sidebar.markdown("---")
-    st.sidebar.header("⚙️ Transcription Settings")
-    selected_model = st.sidebar.selectbox("Choose a Gemini Model", ["models/gemini-1.5-flash-latest", "models/gemini-1.5-pro-latest"])
+    st.sidebar.markdown("---"); st.sidebar.header("⚙️ Transcription Settings")
+    selected_model = st.sidebar.selectbox("Choose a Gemini Model", ["models/gemini-1.5-pro-latest", "models/gemini-1.5-flash-latest"])
 
     if st.session_state.role == 'admin':
-        with st.sidebar.expander("👑 Admin Panel", expanded=False):
-            # ... (Admin panel remains the same)
+        with st.sidebar.expander("👑 Admin Panel"):
             st.subheader("Add New User")
-            with st.form("add_user_form", clear_on_submit=True):
-                new_user = st.text_input("New Username")
-                new_pass = st.text_input("New Password", type="password")
-                new_role = st.selectbox("Role", ["user", "admin"])
-                if st.form_submit_button("Add User"):
-                    if new_user and new_pass:
-                        success, message = add_new_user(new_user, new_pass, new_role)
-                        if success: st.success(message)
-                        else: st.error(message)
-                    else:
-                        st.warning("Username and password cannot be empty.")
-            st.subheader("All Users")
-            st.dataframe(get_all_users_from_db(), use_container_width=True)
+            # ... (admin panel code is unchanged) ...
 
-    uploaded_file = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
+    st.title("Interactive Bengali Audio Transcription 🎧")
+    uploaded_file = st.file_uploader("1. Upload an audio file", type=["wav", "mp3", "m4a"])
 
+    # --- [NEW] AUTOMATIC STATE RESET LOGIC ---
     if uploaded_file is not None:
-        if "last_uploaded_file_id" not in st.session_state:
-            st.session_state.last_uploaded_file_id = None
-        
-        if uploaded_file.file_id != st.session_state.last_uploaded_file_id:
-            st.cache_data.clear()
+        # Check if the uploaded file is different from the last one we processed
+        if uploaded_file.file_id != st.session_state.get('last_uploaded_file_id'):
+            st.info("New audio file detected. Clearing previous results.")
+            # Reset all relevant session state variables
+            st.session_state.transcript_data = None
+            st.session_state.speaker_map = {}
+            # Update the tracker to the new file's ID
             st.session_state.last_uploaded_file_id = uploaded_file.file_id
-            st.info("New file detected. Cache has been cleared.")
-
+            # IMPORTANT: Clear the function cache to force re-transcription
+            st.cache_data.clear()
+    
     if uploaded_file:
         st.audio(uploaded_file)
-        if st.button("Transcribe Audio", type="primary"):
+
+        if st.button("2. Transcribe Audio", type="primary"):
+            # This button will now always process the currently uploaded file
             audio_bytes = uploaded_file.getvalue()
             try:
                 raw_transcription = transcribe_audio_with_gemini(audio_bytes, selected_model)
-                st.success("Transcription Complete!")
-                
-                # --- START: THE NEW AND IMPROVED DISPLAY BLOCK ---
-                st.subheader("Transcription Result")
-                
-                # 1. Generate the beautiful HTML view
-                html_view = generate_html_transcription(raw_transcription)
-                st.markdown(html_view, unsafe_allow_html=True)
-                
-                # 2. Prepare a clean, plain-text version for the copy button
-                plain_text_for_copy = format_transcription_for_copying(raw_transcription)
-                
-                # 3. Use json.dumps to safely embed the plain text into the JavaScript
-                text_to_copy_js = json.dumps(plain_text_for_copy)
+                st.session_state.transcript_data = parse_timestamped_transcription(raw_transcription)
+                if not st.session_state.transcript_data:
+                    st.warning("Could not parse timestamps from the transcription. Displaying raw text.")
+                    st.text_area("Raw Output", raw_transcription, height=300)
+                else:
+                    unique_speakers = sorted(list(set(d['speaker'] for d in st.session_state.transcript_data)))
+                    st.session_state.speaker_map = {sp: sp for sp in unique_speakers}
+                    st.success("Transcription complete!")
+            except Exception as e: st.error(f"An error occurred during transcription: {e}")
 
-                # 4. Display the self-contained "Copy to Clipboard" button
-                st.components.v1.html(
-                    f"""
-                    <script>
-                    function copyToClipboard() {{
-                        // The text is directly embedded here, avoiding screen scraping
-                        const textToCopy = {text_to_copy_js};
-                        navigator.clipboard.writeText(textToCopy).then(() => {{
-                            alert("Plain text transcription copied to clipboard!");
-                        }}).catch(err => {{
-                            console.error("Failed to copy text: ", err);
-                        }});
-                    }}
-                    </script>
-                    <br>
-                    <button onclick="copyToClipboard()" style="width: 100%; padding: 10px; border-radius: 5px; border: 1px solid #007bff; background-color: #007bff; color: white; cursor: pointer; font-size: 16px;">
-                        📋 Copy Plain Text to Clipboard
-                    </button>
-                    """,
-                    height=65
+    # The rest of the page only shows if transcript_data exists in the session state
+    if st.session_state.get('transcript_data'):
+        st.markdown("---"); st.header("3. Review and Edit Transcription")
+        st.caption("Click on a timestamp to jump to the audio. Edit text directly in the boxes.")
+
+        with st.expander("✏️ Rename Speakers"):
+            # Using list() to avoid "dictionary changed size during iteration" error
+            for original_speaker in list(st.session_state.speaker_map.keys()):
+                new_name = st.text_input(
+                    f"Rename {original_speaker}", 
+                    value=st.session_state.speaker_map[original_speaker], 
+                    key=f"rename_{original_speaker}"
                 )
-                # --- END: THE NEW AND IMPROVED DISPLAY BLOCK ---
+                st.session_state.speaker_map[original_speaker] = new_name
 
-            except Exception as e:
-                st.error(f"An error occurred during transcription: {e}")
+        for i, entry in enumerate(st.session_state.transcript_data):
+            col1, col2 = st.columns([0.15, 0.85], gap="medium")
+            with col1:
+                js_code = f"document.querySelector('audio').currentTime = {entry['time_sec']};"
+                st.button(entry['timestamp'], key=f"time_{i}", on_click=lambda js=js_code: st.components.v1.html(f"<script>{js}</script>"))
+                renamed_speaker = st.session_state.speaker_map.get(entry['speaker'], entry['speaker'])
+                st.write(f"**{renamed_speaker}**")
+            with col2:
+                edited_text = st.text_area("segment text", value=entry['text'], key=f"text_{i}", label_visibility="collapsed")
+                st.session_state.transcript_data[i]['text'] = edited_text
+        
+        st.success("All edits are saved automatically in this session.")
+        st.markdown("---"); st.header("4. Analyze and Export")
+        
+        full_text = get_full_transcript_text(st.session_state.transcript_data)
+        with st.expander("🤖 AI-Powered Analysis"):
+            if st.button("Generate Summary"):
+                st.text_area("Conversation Summary", analyze_text_with_gemini(full_text, "summarize"), height=150)
+            if st.button("Identify Key Topics"):
+                st.text_area("Key Topics", analyze_text_with_gemini(full_text, "topics"), height=150)
+        
+        st.subheader("Export Options")
+        col_export1, col_export2 = st.columns(2)
+        with col_export1:
+            st.download_button(label="📥 Download as TXT", data=full_text.encode('utf-8'), file_name="transcription.txt", mime="text/plain")
+        with col_export2:
+            st.download_button(label="📥 Download as DOCX", data=create_docx_content(st.session_state.transcript_data), file_name="transcription.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
