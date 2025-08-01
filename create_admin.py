@@ -1,35 +1,53 @@
 # create_admin.py
-from database import engine, SessionLocal, Base
+
+import sys
+from getpass import getpass
+from database import SessionLocal, init_db
 from models import User
 
-def create_database_and_admin():
-    # This creates the .db file and the users table if they don't exist
-    Base.metadata.create_all(bind=engine)
+def create_admin_user():
+    """A command-line script to create the first admin user."""
 
+    # Initialize the database and create tables if they don't exist
+    print("Initializing database...")
+    init_db()
+    print("Database initialized.")
+    
     db = SessionLocal()
 
     try:
-        # Check if an admin user already exists
-        admin_user = db.query(User).filter(User.username == "admin").first()
-        if admin_user:
-            print("Admin user already exists.")
-            return
+        # Prompt for admin credentials
+        print("\n--- Create Admin User ---")
+        username = input("Enter admin username: ")
 
-        # If not, create one
-        print("Admin user not found, creating one...")
-        admin_password = "admin" # Change this to a more secure default if you want
+        # Check if the user already exists
+        if db.query(User).filter(User.username == username).first():
+            print(f"Error: User '{username}' already exists. Please choose a different username.")
+            sys.exit(1)
+
+        password = getpass("Enter admin password: ")
+        password_confirm = getpass("Confirm admin password: ")
+
+        if password != password_confirm:
+            print("Error: Passwords do not match.")
+            sys.exit(1)
         
-        new_admin = User(username="admin", role="admin")
-        new_admin.set_password(admin_password)
+        if not password:
+            print("Error: Password cannot be empty.")
+            sys.exit(1)
 
-        db.add(new_admin)
+        # Create the new admin user
+        admin_user = User(username=username, role="admin")
+        admin_user.set_password(password)
+
+        db.add(admin_user)
         db.commit()
 
-        print("Admin user 'admin' created successfully.")
-        print(f"Default password: {admin_password}")
+        print(f"\n✅ Admin user '{username}' created successfully!")
+        print("You can now run the Streamlit app and log in.")
 
     finally:
         db.close()
 
 if __name__ == "__main__":
-    create_database_and_admin()
+    create_admin_user()
