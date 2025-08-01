@@ -11,6 +11,11 @@ import re
 import json
 from docx import Document
 import io
+import math
+from datetime import datetime, timedelta
+
+# Import pydub for audio processing
+from pydub import AudioSegment
 
 # --- Database & Authentication Imports ---
 from database import SessionLocal
@@ -37,12 +42,9 @@ except Exception as e:
 
 # --- 3. AUTHENTICATION & DATABASE HELPERS ---
 def authenticate_user(username, password):
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.username == username).first()
-        if user and user.check_password(password): return user
-        return None
-    finally: db.close()
+    db = SessionLocal(); user = db.query(User).filter(User.username == username).first(); db.close()
+    if user and user.check_password(password): return user
+    return None
 
 def add_new_user(username, password, role):
     db = SessionLocal()
@@ -50,42 +52,106 @@ def add_new_user(username, password, role):
         if db.query(User).filter(User.username == username).first(): return False, "User already exists."
         new_user = User(username=username, role=role); new_user.set_password(password)
         db.add(new_user); db.commit()
-        return True, f"User '{username}' created successfully."
+        return True, f"User '{username}' created."
     finally: db.close()
 
 def get_all_users_from_db():
-    db = SessionLocal()
-    try: return db.query(User.username, User.role).all()
-    finally: db.close()
+    db = SessionLocal(); users = db.query(User.username, User.role).all(); db.close()
+    return users
 
 
 # --- 4. CORE TRANSCRIPTION & AI FUNCTIONS ---
-@st.cache_data(show_spinner="Transcribing audio... this may take a few moments.", persist=True)
-def transcribe_audio_with_gemini(_file_content, model_name):
-    tmp_file_path, gemini_file = None, None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-            tmp_file.write(_file_content)
-            tmp_file_path = tmp_file.name
-        
-        st.info("Uploading file to Google for processing...")
-        gemini_file = genai.upload_file(path=tmp_file_path)
-        model = genai.GenerativeModel(model_name=model_name)
-        
-        prompt = (
-            "You are an expert audio transcriber. Transcribe the following Bengali audio file. "
-            "The output transcription MUST be in the Bengali script (Unicode). "
-            "This is a conversation. Identify and label each speaker using 'বক্তা ১:', 'বক্তা ২:', etc. "
-            "CRITICAL: Precede each speaker's dialogue with a precise timestamp in the format [HH:MM:SS.mmm]. "
-            "Example: [00:00:12.345] বক্তা ১: (text here)\n"
-            "Ensure every spoken part has a timestamp. Do not use any markdown or HTML in your output."
-        )
-        response = model.generate_content([prompt, gemini_file], request_options={"timeout": 600})
-        return re.sub(r'<[^>]+>', '', response.text)
-    finally:
-        if tmp_file_path and os.path.exists(tmp_file_path): os.remove(tmp_file_path)
-        if gemini_file: genai.delete_file(gemini_file.name); st.info("Temporary files cleaned up.")
 
+def _offset_timestamps(transcription_text, offset_seconds):
+    """A helper function to add a time offset to all timestamps in a block of text."""
+    
+    def replacer(match):
+        # Parse the timestamp matched by the regex
+        h, m, s, ms = map(int, match.groups())
+        
+        # Create a timedelta object for the original timestamp
+        original_time = timedelta(hours=h, minutes=m, seconds=s, milliseconds=ms)
+        
+        # Add the offset
+        offset_delta = timedelta(seconds=offset_seconds)
+        new_time = original_time + offset_delta
+        
+        # Format the new timestamp back into HH:MM:SS.mmm format
+        # This is a bit complex to handle days and format correctly
+        total_seconds = new_time.total_seconds()
+        new_h = int(total_seconds // 3600)
+        new_m = int((total_seconds % 3600) // 60)
+        new_s = int(total_seconds % 60)
+        new_ms = int(new_time.microseconds / 1000)
+        
+        return f"[{new_h:02d}:{new_m:02d}:{new_s:02d}.{new_ms:03d}]"
+
+    # Regex to find all timestamps in the text
+    pattern = re.compile(r'\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]')
+    return pattern.sub(replacer, transcription_text)
+
+
+@st.cache_data(show_spinner="Preparing audio...", persist=True)
+def transcribe_audio_with_gemini(_file_content, file_type, model_name):
+    """
+    Transcribes audio by chunking it into smaller segments for better accuracy
+    on large files.
+    """
+    CHUNK_LENGTH_MINUTES = 10
+    CHUNK_LENGTH_MS = CHUNK_LENGTH_MINUTES * 60 * 1000
+
+    st.info("Step 1: Normalizing and preparing audio...")
+    audio = AudioSegment.from_file(io.BytesIO(_file_content), format=file_type)
+    processed_audio = audio.set_frame_rate(16000).set_channels(1)
+    processed_audio = processed_audio.apply_gain(-20.0 - processed_audio.dBFS)
+
+    num_chunks = math.ceil(len(processed_audio) / CHUNK_LENGTH_MS)
+    st.info(f"Audio is long. Splitting into {num_chunks} chunk(s) of ~{CHUNK_LENGTH_MINUTES} minutes each.")
+
+    all_transcriptions = []
+    model = genai.GenerativeModel(model_name=model_name)
+    
+    prompt = (
+        "You are a highly accurate audio transcription service. Your task is to transcribe the provided Bengali audio file with maximum precision. "
+        "Follow these rules strictly:\n"
+        "1.  **Output Format:** The transcription must be in Bengali script (Unicode).\n"
+        "2.  **Speaker Diarization:** Identify each speaker and label them as 'বক্তা ১:', 'বক্তা ২:', etc.\n"
+        "3.  **Timestamp Precision:** This is the most critical rule. You MUST provide a precise start timestamp in `[HH:MM:SS.mmm]` format at the beginning of each speaker's turn. The timestamp must be relative to the start of the audio chunk I provide.\n"
+        "4.  **Segmentation:** Create a new timestamped line after a significant pause (more than 2-3 seconds).\n"
+        "5.  **No Extraneous Text:** Your output should only contain timestamps, speaker labels, and the transcribed text.\n"
+    )
+
+    for i in range(num_chunks):
+        start_ms = i * CHUNK_LENGTH_MS
+        end_ms = start_ms + CHUNK_LENGTH_MS
+        audio_chunk = processed_audio[start_ms:end_ms]
+        
+        st.info(f"Processing chunk {i+1} of {num_chunks}...")
+        
+        tmp_file_path, gemini_file = None, None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                audio_chunk.export(tmp_file, format="wav")
+                tmp_file_path = tmp_file.name
+
+            gemini_file = genai.upload_file(path=tmp_file_path)
+            
+            response = model.generate_content([prompt, gemini_file], request_options={"timeout": 600})
+            
+            # Offset timestamps for chunks after the first one
+            offset_seconds = start_ms / 1000
+            chunk_transcription = _offset_timestamps(response.text, offset_seconds)
+            all_transcriptions.append(chunk_transcription)
+
+        finally:
+            if tmp_file_path and os.path.exists(tmp_file_path): os.remove(tmp_file_path)
+            if gemini_file: genai.delete_file(gemini_file.name)
+            
+    st.success("All chunks processed successfully!")
+    return "\n".join(all_transcriptions)
+
+
+# --- (The rest of the app remains the same) ---
 @st.cache_data(show_spinner="Analyzing text...")
 def analyze_text_with_gemini(text_to_analyze, task):
     model = genai.GenerativeModel(model_name="models/gemini-1.5-flash-latest")
@@ -96,7 +162,6 @@ def analyze_text_with_gemini(text_to_analyze, task):
     else: return "Unknown analysis task."
     response = model.generate_content(prompt); return response.text
 
-# --- 5. HELPER FUNCTIONS FOR INTERACTIVITY & EXPORT ---
 def parse_timestamped_transcription(raw_text):
     data = []; pattern = re.compile(r'\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]\s*(বক্তা\s*\d+:)\s*([\s\S]*?)(?=\[\d{2}:\d{2}:\d{2}\.\d{3}\]|\Z)')
     for i, match in enumerate(pattern.finditer(raw_text)):
@@ -116,13 +181,10 @@ def create_docx_content(transcript_data):
         p.add_run(f"{renamed_speaker}\n").bold = True; p.add_run(entry['text'])
     bio = io.BytesIO(); document.save(bio); bio.seek(0); return bio.getvalue()
 
-# --- MAIN APPLICATION UI & LOGIC ---
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False; st.session_state.username = None; st.session_state.role = None
-    st.session_state.transcript_data = None; st.session_state.speaker_map = {}
-    st.session_state.last_uploaded_file_id = None # [NEW] Initialize the tracker
+    st.session_state.transcript_data = None; st.session_state.speaker_map = {}; st.session_state.last_uploaded_file_id = None
 
-# --- AUTHENTICATION GATE ---
 if not st.session_state.authenticated:
     st.header("Bengali Transcriber Login")
     with st.form("login_form"):
@@ -134,7 +196,6 @@ if not st.session_state.authenticated:
                 st.rerun()
             else: st.error("Invalid username or password")
 else:
-    # --- AUTHENTICATED USER INTERFACE ---
     st.sidebar.success(f"Logged in as **{st.session_state.username}**")
     if st.sidebar.button("Logout"):
         for key in list(st.session_state.keys()): del st.session_state[key]
@@ -146,32 +207,35 @@ else:
     if st.session_state.role == 'admin':
         with st.sidebar.expander("👑 Admin Panel"):
             st.subheader("Add New User")
-            # ... (admin panel code is unchanged) ...
+            with st.form("add_user_form", clear_on_submit=True):
+                new_user = st.text_input("New Username"); new_pass = st.text_input("New Password", type="password"); new_role = st.selectbox("Role", ["user", "admin"])
+                if st.form_submit_button("Add User"):
+                    if new_user and new_pass:
+                        success, message = add_new_user(new_user, new_pass, new_role)
+                        if success: st.success(message)
+                        else: st.error(message)
+            st.subheader("All Users"); st.dataframe(get_all_users_from_db(), use_container_width=True)
 
     st.title("Interactive Bengali Audio Transcription 🎧")
+    st.markdown("For best results with long audio files (>15 minutes), please use the `gemini-1.5-pro-latest` model.")
     uploaded_file = st.file_uploader("1. Upload an audio file", type=["wav", "mp3", "m4a"])
 
-    # --- [NEW] AUTOMATIC STATE RESET LOGIC ---
-    if uploaded_file is not None:
-        # Check if the uploaded file is different from the last one we processed
+    if uploaded_file:
         if uploaded_file.file_id != st.session_state.get('last_uploaded_file_id'):
             st.info("New audio file detected. Clearing previous results.")
-            # Reset all relevant session state variables
-            st.session_state.transcript_data = None
-            st.session_state.speaker_map = {}
-            # Update the tracker to the new file's ID
+            st.session_state.transcript_data = None; st.session_state.speaker_map = {}
             st.session_state.last_uploaded_file_id = uploaded_file.file_id
-            # IMPORTANT: Clear the function cache to force re-transcription
             st.cache_data.clear()
     
     if uploaded_file:
         st.audio(uploaded_file)
-
         if st.button("2. Transcribe Audio", type="primary"):
-            # This button will now always process the currently uploaded file
             audio_bytes = uploaded_file.getvalue()
+            raw_format = uploaded_file.type.split('/')[1]
+            format_map = {'x-m4a': 'm4a', 'mpeg': 'mp3'}
+            normalized_format = format_map.get(raw_format, raw_format)
             try:
-                raw_transcription = transcribe_audio_with_gemini(audio_bytes, selected_model)
+                raw_transcription = transcribe_audio_with_gemini(audio_bytes, normalized_format, selected_model)
                 st.session_state.transcript_data = parse_timestamped_transcription(raw_transcription)
                 if not st.session_state.transcript_data:
                     st.warning("Could not parse timestamps from the transcription. Displaying raw text.")
@@ -179,24 +243,18 @@ else:
                 else:
                     unique_speakers = sorted(list(set(d['speaker'] for d in st.session_state.transcript_data)))
                     st.session_state.speaker_map = {sp: sp for sp in unique_speakers}
-                    st.success("Transcription complete!")
-            except Exception as e: st.error(f"An error occurred during transcription: {e}")
+            except Exception as e: 
+                st.error(f"An error occurred during transcription: {e}")
+                if "Decoding failed" in str(e) or "Encoding failed" in str(e):
+                    st.info("💡 Hint: This error can sometimes happen with unusual audio file encodings. Please try converting the file to a standard MP3 or WAV format and re-uploading.")
 
-    # The rest of the page only shows if transcript_data exists in the session state
     if st.session_state.get('transcript_data'):
         st.markdown("---"); st.header("3. Review and Edit Transcription")
         st.caption("Click on a timestamp to jump to the audio. Edit text directly in the boxes.")
-
         with st.expander("✏️ Rename Speakers"):
-            # Using list() to avoid "dictionary changed size during iteration" error
             for original_speaker in list(st.session_state.speaker_map.keys()):
-                new_name = st.text_input(
-                    f"Rename {original_speaker}", 
-                    value=st.session_state.speaker_map[original_speaker], 
-                    key=f"rename_{original_speaker}"
-                )
+                new_name = st.text_input(f"Rename {original_speaker}", value=st.session_state.speaker_map[original_speaker], key=f"rename_{original_speaker}")
                 st.session_state.speaker_map[original_speaker] = new_name
-
         for i, entry in enumerate(st.session_state.transcript_data):
             col1, col2 = st.columns([0.15, 0.85], gap="medium")
             with col1:
@@ -207,17 +265,14 @@ else:
             with col2:
                 edited_text = st.text_area("segment text", value=entry['text'], key=f"text_{i}", label_visibility="collapsed")
                 st.session_state.transcript_data[i]['text'] = edited_text
-        
         st.success("All edits are saved automatically in this session.")
         st.markdown("---"); st.header("4. Analyze and Export")
-        
         full_text = get_full_transcript_text(st.session_state.transcript_data)
         with st.expander("🤖 AI-Powered Analysis"):
             if st.button("Generate Summary"):
                 st.text_area("Conversation Summary", analyze_text_with_gemini(full_text, "summarize"), height=150)
             if st.button("Identify Key Topics"):
                 st.text_area("Key Topics", analyze_text_with_gemini(full_text, "topics"), height=150)
-        
         st.subheader("Export Options")
         col_export1, col_export2 = st.columns(2)
         with col_export1:
