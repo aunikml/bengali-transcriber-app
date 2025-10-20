@@ -132,7 +132,7 @@ def _generate_topics_with_gemini(full_transcript_text):
 # @st.cache_data(show_spinner="Suggesting tags...", persist=True)
 def suggest_tags_for_sentence(sentence_text, predefined_tags):
     if not sentence_text or not sentence_text.strip(): return []
-    model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
+    model = genai.GenerativeModel(model_name="gemini-2.0-flash-lite")
     tags_list_str = ", ".join([f'"{tag}"' for tag in predefined_tags])
     prompt = (f"Analyze this Bengali sentence. Suggest relevant tags ONLY from: [{tags_list_str}]. Prioritize 'Action Item', 'Decision', 'Question'. If none fit, return an empty JSON list. Respond ONLY with a valid JSON list of strings.\n\nSentence: \"{sentence_text}\"")
     try:
@@ -368,7 +368,7 @@ def main():
             st.markdown("---")
             with st.expander("⚙️ Settings & Admin"):
                 st.subheader("Transcription Model")
-                model_options = ["gemini-1.5-flash-latest", "gemini-1.5-pro-latest"]
+                model_options = ["gemini-2.0-flash-lite", "gemini-2.5-flash"]
                 
                 current_model = st.session_state.get('selected_model')
                 default_index = model_options.index(current_model) if current_model in model_options else 0
