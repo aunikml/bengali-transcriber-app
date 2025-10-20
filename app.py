@@ -117,7 +117,7 @@ def _enhance_speech(audio_bytes, original_filename):
 # CACHING TEMPORARILY DISABLED TO FIX PERSISTENT ERROR
 # @st.cache_data(show_spinner="Analyzing topics...", persist=True)
 def _generate_topics_with_gemini(full_transcript_text):
-    model = genai.GenerativeModel(model_name="gemini-1.5-flash-latest")
+    model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
     prompt = ("You are an expert conversation analyst. Analyze the following Bengali transcript and identify the main topics discussed. Create a set of 'smart chapters'.\n"
               "Rules:\n1. Identify 5-7 distinct, high-level topics.\n2. For each topic, provide a short `title` in English.\n3. For each topic, provide a one-sentence `summary` in English.\n4. For each topic, find the `timestamp` (e.g., `[HH:MM:SS]`) where the topic begins.\n5. Respond ONLY with a valid JSON array of objects.\n\n"
               f"Transcript:\n---\n{full_transcript_text}\n---")
@@ -132,7 +132,7 @@ def _generate_topics_with_gemini(full_transcript_text):
 # @st.cache_data(show_spinner="Suggesting tags...", persist=True)
 def suggest_tags_for_sentence(sentence_text, predefined_tags):
     if not sentence_text or not sentence_text.strip(): return []
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash-lite")
+    model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
     tags_list_str = ", ".join([f'"{tag}"' for tag in predefined_tags])
     prompt = (f"Analyze this Bengali sentence. Suggest relevant tags ONLY from: [{tags_list_str}]. Prioritize 'Action Item', 'Decision', 'Question'. If none fit, return an empty JSON list. Respond ONLY with a valid JSON list of strings.\n\nSentence: \"{sentence_text}\"")
     try:
